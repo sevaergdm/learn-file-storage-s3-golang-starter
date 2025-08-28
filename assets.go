@@ -85,7 +85,7 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	if width == 0 || height == 0 {
 		return "", errors.New("Invalid height or width")
 	}
-	r := float64(width)/float64(height)
+	r := float64(width) / float64(height)
 
 	var aspectRatio string
 	if math.Abs(r-16.0/9.0) < 0.02 {
@@ -98,9 +98,24 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	return aspectRatio, nil
 }
 
-func greatestCommonDenominator(x, y int) int {
-	if y == 0 {
-		return x
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("error processing video: %s, %v", stderr.String(), err)
 	}
-	return greatestCommonDenominator(y, x%y)
+	
+	fileInfo, err := os.Stat(outputFilePath)
+	if err != nil {
+		return "", fmt.Errorf("could not stat processed file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty")
+	}
+
+	return outputFilePath, nil
 }

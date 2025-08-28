@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -40,6 +41,17 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	video, err := cfg.db.GetVideo(videoID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to retrieve video", err)
+		return
+	}
+
+	if video.UserID != userID {
+		respondWithError(w, http.StatusUnauthorized, "Not the video owner", err)
+		return
+	}
+
 	file, header, err := r.FormFile("video")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Unable to parse form file", err)
@@ -69,7 +81,6 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Unable to copy file to temporary location", err)
 		return
 	}
-	tempFile.Sync()
 
 	_, err = tempFile.Seek(0, io.SeekStart)
 	if err != nil {
@@ -77,43 +88,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	assetPath := getAssetPath(mediaType)
+	directory := ""
 	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to get aspect ratio", err)
 		return
 	}
 
-	processedAssetPath, err := processVideoForFastStart(tempFile.Name())
+	switch aspectRatio {
+	case "16:9":
+		directory = "landscape"
+	case "9:16":
+		directory = "portrait"
+	default:
+		directory = "other"
+	}
+
+	key := getAssetPath(mediaType)
+	key = path.Join(directory, key)
+
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to process video", err)
 		return
 	}
+	defer os.Remove(processedFilePath)
 
-	reader, err := os.Open(processedAssetPath)
+	processedFile, err := os.Open(processedFilePath)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to read processed video", err)
 		return
 	}
-	defer os.Remove(reader.Name())
-	defer reader.Close()
-
-	var orientation string
-	switch aspectRatio {
-	case "16:9":
-		orientation = "landscape"
-	case "9:16":
-		orientation = "portrait"
-	default:
-		orientation = "other"
-	}
-
-	key := orientation + "/" + assetPath
+	defer processedFile.Close()
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        reader,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -121,33 +132,21 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoData, err := cfg.db.GetVideo(videoID)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Unable to retrieve video", err)
-		return
-	}
-
-	if videoData.UserID != userID {
-		respondWithError(w, http.StatusUnauthorized, "Not the video owner", err)
-		return
-	}
-
-	bucketAndKey := fmt.Sprintf("%s,%s", cfg.s3Bucket, key)
-	videoData.VideoURL = &bucketAndKey
-
-	err = cfg.db.UpdateVideo(videoData)
+	url := fmt.Sprintf("%s,%s", cfg.s3Bucket, key)
+	video.VideoURL = &url
+	err = cfg.db.UpdateVideo(video)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to update video metadata", err)
 		return
 	}
 
-	signedVideo, err := cfg.dbVideoToSignedVideo(videoData)
+	video, err = cfg.dbVideoToSignedVideo(video)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to sign video", err)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, signedVideo)
+	respondWithJSON(w, http.StatusOK, video)
 
 }
 
@@ -174,12 +173,12 @@ func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video
 
 	splitVideo := strings.Split(*video.VideoURL, ",")
 	if len(splitVideo) < 2 {
-		return database.Video{}, fmt.Errorf("Malformed video url")
+		return video, nil
 	}
 
 	bucket := splitVideo[0]
 	key := splitVideo[1]
-	presignedURL, err := generatePresignedURL(cfg.s3Client, bucket, key, time.Duration(1 * time.Minute))
+	presignedURL, err := generatePresignedURL(cfg.s3Client, bucket, key, time.Duration(5 * time.Minute))
 	if err != nil {
 		return database.Video{}, fmt.Errorf("Unable to generate presigned URL: %v", err)
 	}
